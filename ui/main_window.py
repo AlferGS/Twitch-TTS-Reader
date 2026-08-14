@@ -35,6 +35,7 @@ class MainWindow(FluentWindow):
         self.tts_service = TTSService()
         self.twitch_chat = None
         self.tts_enabled = True
+        self.max_queue_size = self.config.get("max_queue_size", 10)
 
         self.speech_started.connect(self._do_highlight)
         self.speech_ended.connect(self._do_unhighlight)
@@ -243,6 +244,7 @@ class MainWindow(FluentWindow):
             return
         self.tts_service.register_item(msg_id, msg_id)
         self.message_queue.add_message(username, speak_text, prefix, msg_id)
+        self.message_queue.trim_to(self.max_queue_size)
 
     def _on_chat_error(self, error_message):
         self.chat_page.add_message(None, error_message, msg_type="error")

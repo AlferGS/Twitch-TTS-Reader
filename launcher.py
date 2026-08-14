@@ -118,11 +118,19 @@ def clean_output_folder(app_dir, max_files=OUTPUT_MAX_FILES,
 
 
 def check_cuda():
-    """Проверка доступности CUDA."""
+    """
+    Проверка наличия NVIDIA GPU БЕЗ импорта torch.
+    Импорт torch в UI-процессе съедал ~0.5-1 ГБ RAM впустую.
+    """
     try:
-        import torch
-        return torch.cuda.is_available()
-    except ImportError:
+        result = subprocess.run(
+            ["nvidia-smi"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+        return result.returncode == 0
+    except Exception:
         return False
 
 
@@ -199,6 +207,10 @@ class ServerStartupWorker(QThread):
     server_ready = pyqtSignal(object)
     error_occurred = pyqtSignal(str)
 
+    def __init__(self, cpu_threads=8):
+        super().__init__()
+        self.cpu_threads = cpu_threads
+
     def run(self):
         try:
             self.stage_changed.emit("config")
@@ -245,11 +257,24 @@ class ServerStartupWorker(QThread):
             # ========================================================
 
             kwargs = {}
+            env = os.environ.copy()
+
+            if not has_cuda:
+                # Ограничиваем потоки CPU-синтеза: меньше троттлинга,
+                # система остаётся отзывчивой, скорость почти та же
+                threads = str(self.cpu_threads)
+                env["OMP_NUM_THREADS"] = threads
+                env["MKL_NUM_THREADS"] = threads
+                env["NUMEXPR_NUM_THREADS"] = threads
+
             if sys.platform == "win32":
-                kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+                flags = subprocess.CREATE_NEW_PROCESS_GROUP
+                if not has_cuda:
+                    flags |= 0x00004000  # BELOW_NORMAL_PRIORITY_CLASS
+                kwargs["creationflags"] = flags
 
             log_message(f"Команда запуска сервера: {' '.join(server_cmd)}", level="STARTUP")
-            server_process = subprocess.Popen(server_cmd, text=True, **kwargs)
+            server_process = subprocess.Popen(server_cmd, text=True, env=env, **kwargs)
             log_message(f"Сервер запущен (PID {server_process.pid})", level="STARTUP")
             time.sleep(0.3)
 
@@ -303,6 +328,19 @@ def main():
                 theme_str = json.load(f).get("theme", "auto")
         except Exception:
             pass
+
+    config = {}
+    if os.path.exists("config.json"):
+        try:
+            with open("config.json", 'r', encoding='utf-8') as f:
+                config = json.load(f)
+        except Exception:
+            config = {}
+    theme_str = config.get("theme", "auto")
+
+    # Потоки CPU-синтеза: по умолчанию половина логических ядер
+    auto_threads = max(4, (os.cpu_count() or 8) // 2)
+    cpu_threads = int(config.get("cpu_threads", 0) or auto_threads)
 
     from qfluentwidgets import setTheme, Theme
     if theme_str == "dark":
@@ -383,7 +421,7 @@ def main():
 
     sys.excepthook = handle_exception
 
-    worker = ServerStartupWorker()
+    worker = ServerStartupWorker(cpu_threads=cpu_threads)
 
     def on_stage_changed(stage_key):
         splash.set_stage(stage_key)

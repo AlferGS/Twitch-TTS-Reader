@@ -46,3 +46,13 @@ class MessageQueue:
                 except queue.Empty:
                     break
             self._counter = 0
+
+    def trim_to(self, max_size):
+        """Выбросить самые старые сообщения, если очередь длиннее max_size."""
+        while self.size() > max_size:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
+            with self._counter_lock:
+                self._counter -= 1
