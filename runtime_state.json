@@ -1,0 +1,7 @@
+{
+  "device_choice": "auto",
+  "device_mode": "cpu",
+  "cuda_available": false,
+  "use_lowvram": false,
+  "vram_limit_mb": 0
+}

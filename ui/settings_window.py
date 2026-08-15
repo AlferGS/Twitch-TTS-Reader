@@ -2,18 +2,33 @@
 Страницы настроек для главного окна.
 Сигнал settings_saved передаёт bool: True если нужно переподключиться к чату.
 """
+"""
+Страницы настроек для главного окна.
+Сигнал settings_saved передаёт bool: True если нужно переподключиться к чату.
+"""
 import time
 import requests
-from PyQt5.QtCore import pyqtSignal, QThread
+
+from PyQt5.QtCore import pyqtSignal, QThread, QTimer
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout,
-    QHeaderView, QTableWidgetItem, QAbstractItemView
+    QHeaderView, QTableWidgetItem, QAbstractItemView, QProgressBar
 )
+
 from qfluentwidgets import (
     FluentIcon, PrimaryPushButton, PushButton, PlainTextEdit, LineEdit,
     CardWidget, SubtitleLabel, BodyLabel, StrongBodyLabel,
-    ComboBox, TableWidget, InfoBar, InfoBarPosition, SwitchButton
+    ComboBox, TableWidget, InfoBar, InfoBarPosition, SwitchButton, SpinBox
 )
+
+from core.system_info import (
+    get_memory_info_for_config,
+    read_runtime_state,
+    DEVICE_MODE_AUTO,
+    DEVICE_MODE_CPU,
+    DEVICE_MODE_CUDA,
+)
+from core.tts_service import get_output_audio_devices
 
 XTTS_API_URL = "http://localhost:8020"
 _voices_cache = None
@@ -137,6 +152,24 @@ class GeneralSettingsPage(QWidget):
         theme_layout.addWidget(theme_info)
         layout.addWidget(theme_card)
 
+        easter_card = CardWidget()
+        easter_layout = QHBoxLayout(easter_card)
+
+        easter_layout.addWidget(BodyLabel("Пасхалки в озвучке:"))
+        easter_layout.addStretch()
+
+        self.easter_egg_switch = SwitchButton()
+        easter_layout.addWidget(self.easter_egg_switch)
+
+        layout.addWidget(easter_card)
+
+        easter_hint = BodyLabel(
+            "💡 Если включено, к озвучке могут добавляться префиксы и постфиксы.\n"
+            "В чате текст сообщения остаётся без изменений."
+        )
+        easter_hint.setStyleSheet("color: gray; font-size: 12px;")
+        layout.addWidget(easter_hint)
+
         save_btn = PrimaryPushButton("💾 Сохранить общие настройки")
         save_btn.clicked.connect(self._on_save)
         layout.addWidget(save_btn)
@@ -151,6 +184,7 @@ class GeneralSettingsPage(QWidget):
         self.limit_combo.setCurrentText(limit_str if limit_str in MESSAGE_LIMIT_PRESETS else "100")
         theme = config.get("theme", "auto")
         self.theme_combo.setCurrentIndex(self._find_theme_index(theme))
+        self.easter_egg_switch.setChecked(bool(config.get("easter_egg_enabled", False)))
 
     def _find_theme_index(self, theme_str):
         for i, (_, value) in enumerate(THEME_OPTIONS):
@@ -170,6 +204,7 @@ class GeneralSettingsPage(QWidget):
             config["theme"] = THEME_OPTIONS[theme_index][1]
         else:
             config["theme"] = "auto"
+        config["easter_egg_enabled"] = self.easter_egg_switch.isChecked()
 
     def _on_save(self):
         self.save(self.config)
@@ -585,3 +620,318 @@ class IgnoreUsersPage(QWidget):
         InfoBar.success(title="Сохранено",
                         content=f"Сохранено {len(self.config.get('ignore_users', []))} пользователей",
                         parent=self, position=InfoBarPosition.TOP, duration=2000)
+
+DEVICE_OPTIONS = [
+    ("Автоматически", DEVICE_MODE_AUTO),
+    ("CPU", DEVICE_MODE_CPU),
+    ("GPU CUDA", DEVICE_MODE_CUDA),
+]
+
+
+class MemoryInfoWorker(QThread):
+    """Фоновый запрос памяти."""
+
+    info_ready = pyqtSignal(dict)
+
+    def __init__(self, config, parent=None):
+        super().__init__(parent)
+        self.config = dict(config or {})
+
+    def run(self):
+        try:
+            info = get_memory_info_for_config(self.config)
+        except Exception as e:
+            info = {
+                "mode": DEVICE_MODE_CPU,
+                "used_mb": 0,
+                "total_mb": 0,
+                "available_mb": 0,
+                "percent": 0,
+                "error": f"{type(e).__name__}: {e}"[:200],
+            }
+        self.info_ready.emit(info)
+
+
+class PerformanceSettingsPage(QWidget):
+    """Настройки CPU/GPU и lowvram."""
+
+    settings_saved = pyqtSignal(bool)
+
+    def __init__(self, config, save_callback):
+        super().__init__()
+        self.setObjectName("performancePage")
+        self.config = config
+        self.save_callback = save_callback
+        self._worker = None
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setInterval(5000)
+        self._refresh_timer.timeout.connect(self._refresh_memory)
+        self._init_ui()
+
+    def _init_ui(self):
+        from PyQt5.QtCore import QTimer
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(30, 30, 30, 30)
+        layout.setSpacing(20)
+
+        layout.addWidget(SubtitleLabel("Производительность"))
+
+        # === Текущее состояние ===
+        status_card = CardWidget()
+        status_layout = QVBoxLayout(status_card)
+        status_layout.setSpacing(8)
+
+        status_layout.addWidget(StrongBodyLabel("Текущий режим сервера"))
+
+        self.current_mode_label = BodyLabel("Определяется...")
+        status_layout.addWidget(self.current_mode_label)
+
+        self.lowvram_state_label = BodyLabel("Low VRAM: —")
+        status_layout.addWidget(self.lowvram_state_label)
+
+        layout.addWidget(status_card)
+
+        # === Настройки ===
+        settings_card = CardWidget()
+        settings_layout = QVBoxLayout(settings_card)
+        settings_layout.setSpacing(10)
+
+        settings_layout.addWidget(StrongBodyLabel("Настройки режима"))
+
+        device_layout = QHBoxLayout()
+        device_layout.addWidget(BodyLabel("Режим работы:"))
+
+        self.device_combo = ComboBox()
+        for label, _ in DEVICE_OPTIONS:
+            self.device_combo.addItem(label)
+
+        device_layout.addWidget(self.device_combo)
+        settings_layout.addLayout(device_layout)
+
+        lowvram_layout = QHBoxLayout()
+        lowvram_layout.addWidget(BodyLabel("Режим низкой VRAM (только для GPU):"))
+        lowvram_layout.addStretch()
+
+        self.lowvram_switch = SwitchButton()
+        self.lowvram_switch.setChecked(True)
+        lowvram_layout.addWidget(self.lowvram_switch)
+
+        settings_layout.addLayout(lowvram_layout)
+
+        hint = BodyLabel(
+            "💡 Режим Low VRAM выгружает модель в RAM когда она не используется.\n"
+            "Это снижает потребление VRAM, но немного замедляет генерацию.\n"
+            "⚠️ Настройки применяются только после перезапуска приложения!"
+        )
+        hint.setStyleSheet("color: gray; font-size: 12px;")
+        settings_layout.addWidget(hint)
+
+        layout.addWidget(settings_card)
+
+        # === Память ===
+        memory_card = CardWidget()
+        memory_layout = QVBoxLayout(memory_card)
+        memory_layout.setSpacing(10)
+
+        memory_layout.addWidget(StrongBodyLabel("Доступная память устройства"))
+
+        self.memory_mode_label = BodyLabel("Устройство: —")
+        memory_layout.addWidget(self.memory_mode_label)
+
+        self.memory_bar = QProgressBar()
+        self.memory_bar.setRange(0, 100)
+        self.memory_bar.setValue(0)
+        memory_layout.addWidget(self.memory_bar)
+
+        self.memory_text_label = BodyLabel("Нажмите «Обновить» для получения данных.")
+        memory_layout.addWidget(self.memory_text_label)
+
+        refresh_btn = PushButton(FluentIcon.SYNC, "Обновить")
+        refresh_btn.clicked.connect(self._refresh_memory)
+        memory_layout.addWidget(refresh_btn)
+
+        layout.addWidget(memory_card)
+
+        audio_card = CardWidget()
+        audio_layout = QVBoxLayout(audio_card)
+        audio_layout.setSpacing(10)
+
+        audio_layout.addWidget(StrongBodyLabel("Устройство вывода звука"))
+
+        audio_layout.addWidget(BodyLabel(
+            "Закрепляет вывод озвучки на выбранном устройстве, "
+            "даже если игра меняет устройство по умолчанию."
+        ))
+
+        self.audio_device_combo = ComboBox()
+        audio_layout.addWidget(self.audio_device_combo)
+
+        audio_hint = BodyLabel(
+            "💡 Настройка применяется сразу.\n"
+            "Если нужного устройства нет в списке, подключи его и нажми «Обновить устройства»."
+        )
+        audio_hint.setStyleSheet("color: gray; font-size: 12px;")
+        audio_layout.addWidget(audio_hint)
+
+        refresh_audio_btn = PushButton(FluentIcon.SYNC, "Обновить устройства")
+        refresh_audio_btn.clicked.connect(self._refresh_audio_devices)
+        audio_layout.addWidget(refresh_audio_btn)
+
+        layout.addWidget(audio_card)
+
+        # === Сохранение ===
+        save_btn = PrimaryPushButton("💾 Сохранить настройки производительности")
+        save_btn.clicked.connect(self._on_save)
+        layout.addWidget(save_btn)
+
+        layout.addStretch()
+
+    def _find_device_index(self, value):
+        value = str(value or DEVICE_MODE_AUTO).lower()
+        for index, (_, key) in enumerate(DEVICE_OPTIONS):
+            if key == value:
+                return index
+        return 0
+
+    def load(self, config):
+        self.config = config
+
+        device_mode = config.get("device_mode", DEVICE_MODE_AUTO)
+        self.device_combo.setCurrentIndex(self._find_device_index(device_mode))
+
+        self.lowvram_switch.setChecked(bool(config.get("use_lowvram", True)))
+
+        self._refresh_mode_label()
+        self._refresh_memory()
+
+        self._load_audio_devices(config.get("audio_device", ""))
+
+    def save(self, config):
+        index = self.device_combo.currentIndex()
+        if 0 <= index < len(DEVICE_OPTIONS):
+            config["device_mode"] = DEVICE_OPTIONS[index][1]
+        else:
+            config["device_mode"] = DEVICE_MODE_AUTO
+
+        config["use_lowvram"] = self.lowvram_switch.isChecked()
+
+        audio_index = self.audio_device_combo.currentIndex()
+
+        if audio_index <= 0:
+            config["audio_device"] = ""
+        else:
+            config["audio_device"] = self.audio_device_combo.currentText()
+
+    def _on_save(self):
+        self.save(self.config)
+        self.save_callback()
+        self.settings_saved.emit(False)
+
+        InfoBar.warning(
+            title="Сохранено",
+            content=(
+                "Настройки режима GPU/Low VRAM применяются после перезапуска.\n"
+                "Устройство вывода звука применяется сразу."
+            ),
+            parent=self,
+            position=InfoBarPosition.TOP,
+            duration=5000
+        )
+
+        self._refresh_mode_label()
+
+    def _refresh_mode_label(self):
+        state = read_runtime_state()
+        mode = state.get("device_mode")
+
+        if mode == DEVICE_MODE_CUDA:
+            self.current_mode_label.setText("GPU CUDA")
+        elif mode == DEVICE_MODE_CPU:
+            self.current_mode_label.setText("CPU")
+        else:
+            self.current_mode_label.setText("Определяется...")
+
+        lowvram_active = bool(
+            state.get("use_lowvram", self.config.get("use_lowvram", True))
+        ) and mode == DEVICE_MODE_CUDA
+
+        self.lowvram_state_label.setText(f"Low VRAM: {'вкл' if lowvram_active else 'выкл'}")
+
+    def _refresh_memory(self):
+        if self._worker is not None and self._worker.isRunning():
+            return
+
+        self._worker = MemoryInfoWorker(self.config, self)
+        self._worker.info_ready.connect(self._on_memory_info)
+        self._worker.start()
+
+    def _on_memory_info(self, info):
+        mode = info.get("mode", DEVICE_MODE_CPU)
+
+        if mode == DEVICE_MODE_CUDA:
+            self.memory_mode_label.setText("Устройство: GPU CUDA")
+        else:
+            self.memory_mode_label.setText("Устройство: CPU (RAM)")
+
+        used_mb = int(info.get("used_mb", 0))
+        total_mb = int(info.get("total_mb", 0))
+        available_mb = int(info.get("available_mb", 0))
+        percent = int(info.get("percent", 0))
+
+        if total_mb > 0:
+            self.memory_bar.setEnabled(True)
+            self.memory_bar.setValue(percent)
+            self.memory_text_label.setText(
+                f"Занято: {used_mb} МБ / {total_mb} МБ    Свободно: {available_mb} МБ"
+            )
+        else:
+            self.memory_bar.setEnabled(False)
+            self.memory_bar.setValue(0)
+            self.memory_text_label.setText("Не удалось получить данные памяти")
+
+        self._refresh_mode_label()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._refresh_mode_label()
+        self._refresh_memory()
+        self._refresh_timer.start()
+
+    def hideEvent(self, event):
+        self._refresh_timer.stop()
+        super().hideEvent(event)
+
+    def _load_audio_devices(self, current_value=""):
+        """Заполнить список устройств вывода."""
+        self.audio_device_combo.clear()
+        self.audio_device_combo.addItem("Авто (устройство по умолчанию)")
+
+        devices = get_output_audio_devices()
+        current = str(current_value or "").strip()
+
+        # Если в конфиге задана подстрока или кастомное имя,
+        # сохраняем его в списке, даже если точного совпадения нет.
+        if current and current not in devices:
+            devices.append(current)
+
+        selected_index = 0
+
+        for name in devices:
+            self.audio_device_combo.addItem(name)
+
+            if current:
+                if current == name or current.lower() in name.lower():
+                    selected_index = self.audio_device_combo.count() - 1
+
+        self.audio_device_combo.setCurrentIndex(selected_index)
+
+    def _refresh_audio_devices(self):
+        """Обновить список устройств."""
+        current_text = self.audio_device_combo.currentText()
+
+        if current_text == "Авто (устройство по умолчанию)":
+            current_value = self.config.get("audio_device", "")
+        else:
+            current_value = current_text
+
+        self._load_audio_devices(current_value)

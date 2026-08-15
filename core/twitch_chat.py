@@ -8,6 +8,7 @@ import random
 import time
 import re
 from PyQt5.QtCore import QThread, pyqtSignal
+from core.error_logger import log_debug
 
 _RE_CHANNEL = [
     re.compile(r'twitch\.tv/popout/([^/]+)/chat', re.IGNORECASE),
@@ -17,7 +18,7 @@ _RE_CHANNEL = [
 _RE_MENTION = re.compile(r'@\w+')
 _RE_URL = re.compile(r'https?://\S+')
 _RE_SPACES = re.compile(r'\s+')
-_RE_PUNCT = re.compile(r'^[\s.,!?;:]+|[\s.,!?;:]+$')
+_RE_PUNCT = re.compile(r'^[\s.,!?;:)(\[\]<>]+|[\s.,!?;:)(\[\]<>]+$')
 _RE_USERNAME = re.compile(r':([^!]+)!')
 _RE_PRIVMSG = re.compile(r'PRIVMSG #[^:]+:(.+)$')
 _RE_REPEAT_PUNCT = re.compile(r'([!?.…])\s*\1+')
@@ -141,19 +142,34 @@ class TwitchChatReader(QThread):
     def run(self):
         self.running = True
         reconnect_delay = 5
+
         if not self.channel:
+            log_debug(
+                "IRC",
+                "invalid channel",
+                url=self.channel_url[:120],
+            )
             self.error_occurred.emit(f"Не удалось определить канал: {self.channel_url}")
             return
+
         while self.running:
             try:
                 self._connect_and_listen()
             except Exception as e:
                 if self.running:
+                    log_debug(
+                        "IRC",
+                        "connection lost",
+                        error=f"{type(e).__name__}: {e}"[:200],
+                        reconnect_delay=reconnect_delay,
+                    )
                     self.error_occurred.emit(
                         f"Соединение потеряно: {str(e)}. Переподключение через {reconnect_delay}с..."
                     )
+
             if not self.running:
                 break
+
             for _ in range(reconnect_delay):
                 if not self.running:
                     break
@@ -171,25 +187,48 @@ class TwitchChatReader(QThread):
         for server, port in _IRC_SERVERS:
             if not self.running:
                 return
+
             try:
                 self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 self.sock.settimeout(10)
                 self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 self.sock.connect((server, port))
+
                 self.sock.sendall(cap_bytes)
                 self.sock.sendall(nick_bytes)
                 self.sock.sendall(join_bytes)
+
                 print(f"[TwitchChat] Подключено к {channel_str}")
+                log_debug(
+                    "IRC",
+                    "connected",
+                    server=server,
+                    port=port,
+                    channel=self.channel,
+                )
+
                 last_error = None
                 break
+
             except (socket.error, socket.timeout) as e:
                 last_error = e
+
+                log_debug(
+                    "IRC",
+                    "connect failed",
+                    server=server,
+                    port=port,
+                    error=type(e).__name__,
+                )
+
                 if self.sock:
                     try:
                         self.sock.close()
-                    except Exception:
-                        pass
+                    except (socket.error, OSError):
+                        self.sock = None
+
                     self.sock = None
+
                 continue
 
         if last_error is not None or self.sock is None:
@@ -256,20 +295,26 @@ class TwitchChatReader(QThread):
 
             username_match = _RE_USERNAME.search(line)
             if not username_match:
+                log_debug("IRC", "parse missing username")
                 return
+
             username = username_match.group(1)
 
             message_match = _RE_PRIVMSG.search(line)
             if not message_match:
+                log_debug("IRC", "parse missing privmsg", user=username)
                 return
+
             raw_text = message_match.group(1).strip()
 
             prefix_found = None
             text_without_prefix = raw_text
+
             for prefix in self.sorted_prefixes:
                 pattern = self.prefix_patterns.get(prefix)
                 if pattern is None:
                     continue
+
                 match = pattern.match(raw_text)
                 if match:
                     prefix_found = prefix
@@ -280,19 +325,23 @@ class TwitchChatReader(QThread):
             speak_text = self._clean_for_speech(text_without_prefix)
 
             self.message_received.emit(
-                username, display_text, speak_text, prefix_found or "", reply_info
+                username,
+                display_text,
+                speak_text,
+                prefix_found or "",
+                reply_info
             )
-        except Exception:
-            pass
+
+        except Exception as e:
+            log_debug(
+                "IRC",
+                "parse error",
+                error=f"{type(e).__name__}: {e}"[:200],
+            )
 
     def stop(self):
         self.running = False
-        sock = self.sock
-        if sock is not None:
-            try:
-                sock.shutdown(socket.SHUT_RDWR)
-            except (socket.error, OSError):
-                pass
+        self._close_socket()
 
     def is_running(self):
         return self.running

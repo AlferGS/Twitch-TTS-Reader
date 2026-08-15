@@ -178,3 +178,94 @@ def install_exception_hooks():
     if hasattr(threading, 'excepthook'):
         threading.excepthook = log_thread_exception
     log_message("Обработчики исключений установлены", level="STARTUP")
+
+
+_DEBUG_LOG_NAME = "debug.log"
+_DEBUG_MAX_BYTES = 5 * 1024 * 1024
+_debug_lock = threading.Lock()
+
+
+def get_debug_log_path():
+    """Путь к текущему debug-логу."""
+    return os.path.join(get_logs_dir(), _DEBUG_LOG_NAME)
+
+
+def _rotate_debug_log(path):
+    """
+    Простая ротация:
+    debug.log -> debug.log.1
+    """
+    try:
+        if os.path.exists(path) and os.path.getsize(path) > _DEBUG_MAX_BYTES:
+            backup = path + ".1"
+
+            if os.path.exists(backup):
+                os.remove(backup)
+
+            os.replace(path, backup)
+    except OSError:
+        # Если ротация не удалась, пытаемся продолжать писать в текущий файл.
+        return
+
+
+def _debug_field_value(value):
+    """
+    Привести значение поля к безопасной короткой строке.
+    Без переносов строк и без бесконечных значений.
+    """
+    try:
+        text = str(value)
+    except Exception:
+        return "<unprintable>"
+
+    text = text.replace("\n", " ").replace("\r", " ").replace('"', "'")
+
+    if len(text) > 200:
+        text = text[:197] + "..."
+
+    return text
+
+
+def log_debug(source, message, **fields):
+    """
+    Короткая техническая запись в error_logs/debug.log.
+
+    Пример:
+    [2026-06-16 12:00:00.123] [TTS] gen ready | item_id="42" ms="812" status="200"
+    """
+    try:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+        if fields:
+            field_text = " ".join(
+                f'{key}="{_debug_field_value(fields[key])}"'
+                for key in sorted(fields)
+            )
+            line = f"[{timestamp}] [{source}] {message} | {field_text}"
+        else:
+            line = f"[{timestamp}] [{source}] {message}"
+
+        with _debug_lock:
+            logs_dir = get_logs_dir()
+            os.makedirs(logs_dir, exist_ok=True)
+
+            path = get_debug_log_path()
+            _rotate_debug_log(path)
+
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+
+    except Exception as exc:
+        # Логгер не должен ронять приложение.
+        # Если не смогли записать в файл, пытаемся сообщить в stderr.
+        try:
+            if sys.stderr is not None:
+                print(
+                    f"[debug-log failed] source={source} "
+                    f"error={type(exc).__name__}: {exc}",
+                    file=sys.stderr
+                )
+        except Exception:
+            return
+
+        return

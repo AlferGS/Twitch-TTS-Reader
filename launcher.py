@@ -27,6 +27,24 @@ if sys.stdout is None:
     sys.stdout = open(os.devnull, "w", encoding="utf-8")
 if sys.stderr is None:
     sys.stderr = open(os.devnull, "w", encoding="utf-8")
+
+# === FIX: не показывать консольные окна subprocess в windowed-сборке ===
+if sys.platform == "win32":
+    import subprocess
+
+    CREATE_NO_WINDOW = 0x08000000
+    _original_popen_init = subprocess.Popen.__init__
+
+    def _no_window_popen_init(self, *args, **kwargs):
+        try:
+            current_flags = int(kwargs.get("creationflags", 0) or 0)
+        except Exception:
+            current_flags = 0
+
+        kwargs["creationflags"] = current_flags | CREATE_NO_WINDOW
+        _original_popen_init(self, *args, **kwargs)
+
+    subprocess.Popen.__init__ = _no_window_popen_init
     
 import time
 import json
@@ -43,6 +61,14 @@ from PyQt5.QtWidgets import QApplication, QMessageBox
 from core.error_logger import (
     log_error, log_message, log_startup_stage,
     install_exception_hooks, get_log_path, get_logs_dir
+)
+from core.system_info import (
+    detect_cuda_available,
+    resolve_runtime_mode,
+    write_runtime_state,
+    DEVICE_MODE_AUTO,
+    DEVICE_MODE_CPU,
+    DEVICE_MODE_CUDA,
 )
 
 XTTS_HOST = "http://localhost:8020"
@@ -119,19 +145,10 @@ def clean_output_folder(app_dir, max_files=OUTPUT_MAX_FILES,
 
 def check_cuda():
     """
-    Проверка наличия NVIDIA GPU БЕЗ импорта torch.
-    Импорт torch в UI-процессе съедал ~0.5-1 ГБ RAM впустую.
+    Оставлено для совместимости.
+    Теперь используется core.system_info.detect_cuda_available().
     """
-    try:
-        result = subprocess.run(
-            ["nvidia-smi"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=5,
-        )
-        return result.returncode == 0
-    except Exception:
-        return False
+    return detect_cuda_available()
 
 
 def cleanup_server_process(server_process):
@@ -207,9 +224,12 @@ class ServerStartupWorker(QThread):
     server_ready = pyqtSignal(object)
     error_occurred = pyqtSignal(str)
 
-    def __init__(self, cpu_threads=8):
+    def __init__(self, cpu_threads=8, device_choice=DEVICE_MODE_AUTO, use_lowvram=True, vram_limit_mb=0):
         super().__init__()
         self.cpu_threads = cpu_threads
+        self.device_choice = str(device_choice or DEVICE_MODE_AUTO).lower()
+        self.use_lowvram = bool(use_lowvram)
+        self.vram_limit_mb = int(vram_limit_mb or 0)
 
     def run(self):
         try:
@@ -221,9 +241,39 @@ class ServerStartupWorker(QThread):
             self.stage_changed.emit("gpu")
             self.stage_text_changed.emit("Проверка GPU...")
             log_startup_stage("Проверка GPU")
-            has_cuda = check_cuda()
-            os.environ['TTS_DEVICE_MODE'] = 'cuda' if has_cuda else 'cpu'
-            log_message(f"GPU: {'CUDA доступна' if has_cuda else 'CPU режим'}", level="STARTUP")
+
+            cuda_available = detect_cuda_available()
+            runtime_mode = resolve_runtime_mode(
+                {"device_mode": self.device_choice},
+                cuda_available=cuda_available
+            )
+
+            has_cuda = runtime_mode == DEVICE_MODE_CUDA
+
+            if self.device_choice == DEVICE_MODE_CUDA and not has_cuda:
+                log_message(
+                    "Запрошен CUDA, но GPU недоступен. Сервер будет запущен в CPU режиме.",
+                    level="WARNING"
+                )
+
+            os.environ["TTS_DEVICE_MODE"] = runtime_mode
+            os.environ["TTS_USE_LOWVRAM"] = "1" if (has_cuda and self.use_lowvram) else "0"
+            os.environ["TTS_VRAM_LIMIT_MB"] = str(self.vram_limit_mb if has_cuda else 0)
+
+            write_runtime_state({
+                "device_choice": self.device_choice,
+                "device_mode": runtime_mode,
+                "cuda_available": cuda_available,
+                "use_lowvram": has_cuda and self.use_lowvram,
+                "vram_limit_mb": self.vram_limit_mb if has_cuda else 0,
+            })
+
+            log_message(
+                f"Режим сервера: {'CUDA' if has_cuda else 'CPU'}, "
+                f"lowvram={has_cuda and self.use_lowvram}, vram_limit_mb={self.vram_limit_mb if has_cuda else 0}",
+                level="STARTUP"
+            )
+
             time.sleep(0.2)
 
             try:
@@ -240,10 +290,9 @@ class ServerStartupWorker(QThread):
             self.stage_changed.emit("server_start")
             log_startup_stage("Запуск XTTS сервера")
 
-            # ============ ВАЖНО: команда запуска сервера ============
             frozen = is_frozen()
             print(f"[ServerStartupWorker] is_frozen()={frozen}")
-            
+
             if frozen:
                 server_cmd = [sys.executable, "--server"]
             else:
@@ -251,17 +300,17 @@ class ServerStartupWorker(QThread):
 
             if has_cuda:
                 server_cmd += ["--device", "cuda"]
+                if self.use_lowvram:
+                    server_cmd += ["--lowvram"]
                 self.stage_text_changed.emit("Запуск XTTS сервера (CUDA)...")
             else:
+                server_cmd += ["--device", "cpu"]
                 self.stage_text_changed.emit("Запуск XTTS сервера (CPU)...")
-            # ========================================================
 
             kwargs = {}
             env = os.environ.copy()
 
             if not has_cuda:
-                # Ограничиваем потоки CPU-синтеза: меньше троттлинга,
-                # система остаётся отзывчивой, скорость почти та же
                 threads = str(self.cpu_threads)
                 env["OMP_NUM_THREADS"] = threads
                 env["MKL_NUM_THREADS"] = threads
@@ -270,17 +319,21 @@ class ServerStartupWorker(QThread):
             if sys.platform == "win32":
                 flags = subprocess.CREATE_NEW_PROCESS_GROUP
                 if not has_cuda:
-                    flags |= 0x00004000  # BELOW_NORMAL_PRIORITY_CLASS
+                    flags |= 0x00004000
                 kwargs["creationflags"] = flags
 
             log_message(f"Команда запуска сервера: {' '.join(server_cmd)}", level="STARTUP")
+
             server_process = subprocess.Popen(server_cmd, text=True, env=env, **kwargs)
             log_message(f"Сервер запущен (PID {server_process.pid})", level="STARTUP")
+
             time.sleep(0.3)
 
             self.stage_changed.emit("model_load")
             log_startup_stage("Ожидание загрузки модели")
+
             start_time = time.time()
+
             while time.time() - start_time < HEALTH_CHECK_TIMEOUT:
                 try:
                     response = requests.get(f"{XTTS_HOST}/speakers", timeout=2)
@@ -292,6 +345,7 @@ class ServerStartupWorker(QThread):
                         return
                 except requests.exceptions.RequestException:
                     pass
+
                 elapsed = int(time.time() - start_time)
                 self.stage_text_changed.emit(f"Загрузка модели голосов... ({elapsed} сек)")
                 time.sleep(HEALTH_CHECK_INTERVAL)
@@ -303,7 +357,6 @@ class ServerStartupWorker(QThread):
         except Exception as e:
             log_error(type(e), e, tb=e.__traceback__, context="Запуск XTTS сервера")
             self.error_occurred.emit(f"Ошибка запуска сервера: {str(e)}")
-
 
 def main():
     if is_frozen():
@@ -421,7 +474,12 @@ def main():
 
     sys.excepthook = handle_exception
 
-    worker = ServerStartupWorker(cpu_threads=cpu_threads)
+    worker = ServerStartupWorker(
+        cpu_threads=cpu_threads,
+        device_choice=str(config.get("device_mode", DEVICE_MODE_AUTO)),
+        use_lowvram=bool(config.get("use_lowvram", True)),
+        vram_limit_mb=int(config.get("vram_limit_mb", 0) or 0),
+    )
 
     def on_stage_changed(stage_key):
         splash.set_stage(stage_key)
@@ -499,20 +557,32 @@ def main():
 def run_server_mode():
     """Релизный режим: запустить XTTS сервер в этом же exe."""
     import inspect
+
     _original_getsource = inspect.getsource
-    
+
     def _safe_getsource(obj):
         try:
             return _original_getsource(obj)
         except OSError:
             return ""
-    
-    inspect.getsource = _safe_getsource
-    
-    import runpy
-    sys.argv = [sys.argv[0]] + [a for a in sys.argv[1:] if a != "--server"]
-    runpy.run_module("xtts_api_server", run_name="__main__", alter_sys=True)
 
+    inspect.getsource = _safe_getsource
+
+    try:
+        from core.system_info import apply_server_runtime_settings
+        apply_server_runtime_settings()
+    except Exception as e:
+        print(f"[ServerRuntime] setup failed: {type(e).__name__}: {e}")
+
+    import runpy
+
+    sys.argv = [
+        sys.argv[0]
+    ] + [
+        arg for arg in sys.argv[1:] if arg != "--server"
+    ]
+
+    runpy.run_module("xtts_api_server", run_name="__main__", alter_sys=True)
 
 if __name__ == "__main__":
     import multiprocessing

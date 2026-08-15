@@ -21,6 +21,7 @@ hiddenimports = [
     # наши модули
     'core', 'core.error_logger', 'core.message_queue',
     'core.tts_service', 'core.twitch_chat',
+    'core.system_info', 'core.server_runner',
     'ui', 'ui.chat_page', 'ui.main_window', 'ui.settings_window', 'ui.splash_window',
 ]
 

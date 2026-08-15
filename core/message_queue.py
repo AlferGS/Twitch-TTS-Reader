@@ -38,21 +38,35 @@ class MessageQueue:
             return max(0, self._counter)
 
     def clear(self):
+        """Полностью очистить очередь. Возвращает количество удалённых элементов."""
+        cleared = 0
+
         with self._counter_lock:
             while True:
                 try:
                     self._queue.get_nowait()
                     self._counter -= 1
+                    cleared += 1
                 except queue.Empty:
                     break
+
             self._counter = 0
+
+        return cleared
 
     def trim_to(self, max_size):
         """Выбросить самые старые сообщения, если очередь длиннее max_size."""
+        dropped = 0
+
         while self.size() > max_size:
             try:
                 self._queue.get_nowait()
             except queue.Empty:
                 break
+
             with self._counter_lock:
                 self._counter -= 1
+
+            dropped += 1
+
+        return dropped
