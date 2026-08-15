@@ -11,14 +11,15 @@ import requests
 
 from PyQt5.QtCore import pyqtSignal, QThread, QTimer
 from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout,
+    QWidget, QVBoxLayout, QHBoxLayout, QFrame,
     QHeaderView, QTableWidgetItem, QAbstractItemView, QProgressBar
 )
 
 from qfluentwidgets import (
     FluentIcon, PrimaryPushButton, PushButton, PlainTextEdit, LineEdit,
     CardWidget, SubtitleLabel, BodyLabel, StrongBodyLabel,
-    ComboBox, TableWidget, InfoBar, InfoBarPosition, SwitchButton, SpinBox
+    ComboBox, TableWidget, InfoBar, InfoBarPosition, SwitchButton,
+    ScrollArea
 )
 
 from core.system_info import (
@@ -29,6 +30,33 @@ from core.system_info import (
     DEVICE_MODE_CUDA,
 )
 from core.tts_service import get_output_audio_devices
+
+class ScrollableSettingsPage(QWidget):
+    """
+    Базовая страница настроек с автоматическим скроллом.
+
+    Все страницы настроек должны наследоваться от этого класса.
+    Контент добавляется в self.content_layout.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.setSpacing(0)
+
+        self._scroll_area = ScrollArea()
+        self._scroll_area.setWidgetResizable(True)
+        self._scroll_area.setFrameShape(QFrame.NoFrame)
+
+        self._content_widget = QWidget()
+        self.content_layout = QVBoxLayout(self._content_widget)
+        self.content_layout.setContentsMargins(30, 30, 30, 30)
+        self.content_layout.setSpacing(20)
+
+        self._scroll_area.setWidget(self._content_widget)
+        outer_layout.addWidget(self._scroll_area)
 
 XTTS_API_URL = "http://localhost:8020"
 _voices_cache = None
@@ -88,7 +116,7 @@ class VoicesLoader(QThread):
         self.voices_loaded.emit(get_available_voices(force_refresh=True, timeout=30))
 
 
-class GeneralSettingsPage(QWidget):
+class GeneralSettingsPage(ScrollableSettingsPage):
     """Канал, автостарт, лимит сообщений, тема."""
 
     settings_saved = pyqtSignal(bool)
@@ -102,9 +130,7 @@ class GeneralSettingsPage(QWidget):
         self._init_ui()
 
     def _init_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(30, 30, 30, 30)
-        layout.setSpacing(20)
+        layout = self.content_layout
         layout.addWidget(SubtitleLabel("Общие настройки"))
 
         channel_card = CardWidget()
@@ -134,6 +160,7 @@ class GeneralSettingsPage(QWidget):
         self.limit_combo.addItems(MESSAGE_LIMIT_PRESETS)
         limit_layout.addWidget(self.limit_combo)
         limit_info = BodyLabel("💡 Меньше сообщений — меньше потребление памяти и быстрее отрисовка.")
+        limit_info.setWordWrap(True)
         limit_info.setStyleSheet("color: gray; font-size: 12px;")
         limit_layout.addWidget(limit_info)
         layout.addWidget(limit_card)
@@ -148,6 +175,7 @@ class GeneralSettingsPage(QWidget):
             self.theme_combo.addItem(label)
         theme_layout.addWidget(self.theme_combo)
         theme_info = BodyLabel("💡 Тема применяется сразу после сохранения. 'Автоматически' следует за системной темой Windows.")
+        theme_info.setWordWrap(True)
         theme_info.setStyleSheet("color: gray; font-size: 12px;")
         theme_layout.addWidget(theme_info)
         layout.addWidget(theme_card)
@@ -164,13 +192,16 @@ class GeneralSettingsPage(QWidget):
         layout.addWidget(easter_card)
 
         easter_hint = BodyLabel(
-            "💡 Если включено, к озвучке могут добавляться префиксы и постфиксы.\n"
+            "💡 Если включено, к озвучке могут добавляться пасхалки.\n"
             "В чате текст сообщения остаётся без изменений."
         )
+        easter_hint.setWordWrap(True)
         easter_hint.setStyleSheet("color: gray; font-size: 12px;")
         layout.addWidget(easter_hint)
 
         save_btn = PrimaryPushButton("💾 Сохранить общие настройки")
+        save_btn.setFixedHeight(40)
+        save_btn.setMinimumWidth(200)
         save_btn.clicked.connect(self._on_save)
         layout.addWidget(save_btn)
         layout.addStretch()
@@ -216,7 +247,7 @@ class GeneralSettingsPage(QWidget):
                         parent=self, position=InfoBarPosition.TOP, duration=2000)
 
 
-class VoicesSettingsPage(QWidget):
+class VoicesSettingsPage(ScrollableSettingsPage):
     """Голос по умолчанию, режим озвучки, таблица префиксов."""
 
     settings_saved = pyqtSignal(bool)
@@ -232,14 +263,14 @@ class VoicesSettingsPage(QWidget):
         self._start_load()
 
     def _init_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(30, 30, 30, 30)
-        layout.setSpacing(20)
+        layout = self.content_layout
 
         header = QHBoxLayout()
         header.addWidget(SubtitleLabel("Настройки голосов"))
         header.addStretch()
         self.refresh_btn = PushButton(FluentIcon.SYNC, "Обновить список")
+        self.refresh_btn.setFixedHeight(40)
+        self.refresh_btn.setMinimumWidth(200)
         self.refresh_btn.clicked.connect(self._start_load)
         header.addWidget(self.refresh_btn)
         layout.addLayout(header)
@@ -252,7 +283,9 @@ class VoicesSettingsPage(QWidget):
         default_layout = QVBoxLayout(default_card)
         default_layout.setSpacing(10)
         default_layout.addWidget(StrongBodyLabel("Голос по умолчанию"))
-        default_layout.addWidget(BodyLabel("Используется когда префикс не указан или режим префиксов выключен:"))
+        self.prefix_hint = BodyLabel("Используется когда префикс не указан или режим префиксов выключен:")
+        self.prefix_hint.setWordWrap(True)
+        default_layout.addWidget(self.prefix_hint)
         self.default_combo = ComboBox()
         default_layout.addWidget(self.default_combo)
         layout.addWidget(default_card)
@@ -276,10 +309,12 @@ class VoicesSettingsPage(QWidget):
         prefix_layout = QVBoxLayout(prefix_card)
         prefix_layout.setSpacing(10)
         prefix_layout.addWidget(StrongBodyLabel("Привязка префиксов к голосам"))
-        prefix_layout.addWidget(BodyLabel(
+        self.prefix_example = BodyLabel(
             "💡 Сообщения, начинающиеся с префикса, озвучиваются соответствующим голосом.\n"
             "Пример: '!m привет' — озвучит голосом, привязанным к префиксу !m."
-        ))
+        )
+        self.prefix_example.setWordWrap(True)
+        prefix_layout.addWidget(self.prefix_example)
         self.prefix_table = TableWidget()
         self.prefix_table.setColumnCount(2)
         self.prefix_table.setHorizontalHeaderLabels(["Префикс", "Голос"])
@@ -290,9 +325,13 @@ class VoicesSettingsPage(QWidget):
 
         btn_layout = QHBoxLayout()
         add_btn = PrimaryPushButton(FluentIcon.ADD, "Добавить префикс")
+        add_btn.setFixedHeight(40)
+        add_btn.setMinimumWidth(200)
         add_btn.clicked.connect(self._add_prefix_row)
         btn_layout.addWidget(add_btn)
         remove_btn = PushButton(FluentIcon.DELETE, "Удалить выбранное")
+        remove_btn.setFixedHeight(40)
+        remove_btn.setMinimumWidth(200)
         remove_btn.clicked.connect(self._remove_selected_prefix)
         btn_layout.addWidget(remove_btn)
         btn_layout.addStretch()
@@ -300,6 +339,8 @@ class VoicesSettingsPage(QWidget):
         layout.addWidget(prefix_card)
 
         save_btn = PrimaryPushButton("💾 Сохранить голоса")
+        save_btn.setFixedHeight(40)
+        save_btn.setMinimumWidth(200)
         save_btn.clicked.connect(self._on_save)
         layout.addWidget(save_btn)
         layout.addStretch()
@@ -309,6 +350,7 @@ class VoicesSettingsPage(QWidget):
             self.mode_hint.setText("✓ Озвучка использует привязки пользователей и префиксы из таблицы ниже.")
         else:
             self.mode_hint.setText("✗ Все сообщения озвучиваются голосом по умолчанию.")
+        self.mode_hint.setWordWrap(True)
 
     def _start_load(self):
         self.status_label.setText("⏳ Загрузка списка голосов...")
@@ -318,6 +360,7 @@ class VoicesSettingsPage(QWidget):
         if cached:
             self._apply_voices(cached)
             self.status_label.setText(f"✓ Загружено {len(cached)} голосов (обновление в фоне...)")
+            self.status_label.setWordWrap(True)
         self.loader = VoicesLoader()
         self.loader.voices_loaded.connect(self._on_voices_loaded)
         self.loader.finished.connect(lambda: self.refresh_btn.setEnabled(True))
@@ -397,7 +440,7 @@ class VoicesSettingsPage(QWidget):
                         parent=self, position=InfoBarPosition.TOP, duration=2000)
 
 
-class UsersSettingsPage(QWidget):
+class UsersSettingsPage(ScrollableSettingsPage):
     """Таблица привязок: никнейм → голос + цвет."""
 
     settings_saved = pyqtSignal(bool)
@@ -412,22 +455,26 @@ class UsersSettingsPage(QWidget):
         self._refresh_voices()
 
     def _init_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(30, 30, 30, 30)
-        layout.setSpacing(20)
+        layout = self.content_layout
 
         header = QHBoxLayout()
         header.addWidget(SubtitleLabel("Привязка пользователей"))
         header.addStretch()
+
         refresh_btn = PushButton(FluentIcon.SYNC, "Обновить голоса")
+        refresh_btn.setFixedHeight(36)
+        refresh_btn.setMinimumWidth(160)
         refresh_btn.clicked.connect(self._refresh_voices)
         header.addWidget(refresh_btn)
+
         layout.addLayout(header)
 
-        layout.addWidget(BodyLabel(
+        hint_label = BodyLabel(
             "💡 Пользователи из этого списка всегда озвучиваются выбранным голосом, "
             "игнорируя префиксы. Цвет никнейма в чате тоже можно задать."
-        ))
+        )
+        hint_label.setWordWrap(True)
+        layout.addWidget(hint_label)
 
         self.table = TableWidget()
         self.table.setColumnCount(3)
@@ -438,16 +485,27 @@ class UsersSettingsPage(QWidget):
         layout.addWidget(self.table)
 
         btn_layout = QHBoxLayout()
+
         add_btn = PrimaryPushButton(FluentIcon.ADD, "Добавить")
+        add_btn.setFixedHeight(36)
+        add_btn.setMinimumWidth(130)
         add_btn.clicked.connect(self._add_row)
         btn_layout.addWidget(add_btn)
+
         remove_btn = PushButton(FluentIcon.DELETE, "Удалить выбранное")
+        remove_btn.setFixedHeight(36)
+        remove_btn.setMinimumWidth(160)
         remove_btn.clicked.connect(self._remove_selected)
         btn_layout.addWidget(remove_btn)
+
         btn_layout.addStretch()
+
         save_btn = PushButton("💾 Сохранить")
+        save_btn.setFixedHeight(36)
+        save_btn.setMinimumWidth(130)
         save_btn.clicked.connect(self._on_save)
         btn_layout.addWidget(save_btn)
+
         layout.addLayout(btn_layout)
         layout.addStretch()
 
@@ -525,7 +583,7 @@ class UsersSettingsPage(QWidget):
                         parent=self, position=InfoBarPosition.TOP, duration=2000)
 
 
-class IgnoreWordsPage(QWidget):
+class IgnoreWordsPage(ScrollableSettingsPage):
     """Список слов, которые игнорируются при озвучке."""
 
     settings_saved = pyqtSignal(bool)
@@ -539,20 +597,22 @@ class IgnoreWordsPage(QWidget):
         self._init_ui()
 
     def _init_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(30, 30, 30, 30)
-        layout.setSpacing(20)
+        layout = self.content_layout
         layout.addWidget(SubtitleLabel("Игнорируемые слова"))
-        layout.addWidget(BodyLabel(
+        self.banned_words_hint = BodyLabel(
             "💡 Слова из этого списка удаляются из текста перед озвучкой.\n"
             "Используйте для смайликов (Kappa, LUL, orkHello и т.д.).\n"
             "Вводите по одному слову на строку."
-        ))
+        )
+        self.banned_words_hint.setWordWrap(True)
+        layout.addWidget(self.banned_words_hint)
         self.text_edit = PlainTextEdit()
         self.text_edit.setPlaceholderText("Kappa\nLUL\norkHello\nmonkaW")
         self.text_edit.setStyleSheet("font-family: 'Consolas', monospace; font-size: 13px;")
         layout.addWidget(self.text_edit)
         save_btn = PrimaryPushButton("💾 Сохранить список")
+        save_btn.setFixedHeight(40)
+        save_btn.setMinimumWidth(200)
         save_btn.clicked.connect(self._on_save)
         layout.addWidget(save_btn)
 
@@ -576,7 +636,7 @@ class IgnoreWordsPage(QWidget):
                         parent=self, position=InfoBarPosition.TOP, duration=2000)
 
 
-class IgnoreUsersPage(QWidget):
+class IgnoreUsersPage(ScrollableSettingsPage):
     """Список пользователей, чьи сообщения не озвучиваются."""
 
     settings_saved = pyqtSignal(bool)
@@ -589,20 +649,22 @@ class IgnoreUsersPage(QWidget):
         self._init_ui()
 
     def _init_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(30, 30, 30, 30)
-        layout.setSpacing(20)
+        layout = self.content_layout
         layout.addWidget(SubtitleLabel("Игнорируемые пользователи"))
-        layout.addWidget(BodyLabel(
+        self.bot_names_hint = BodyLabel(
             "💡 Сообщения этих пользователей видны в чате, но НЕ озвучиваются.\n"
             "Используйте для ботов (Nightbot, StreamElements и т.д.).\n"
             "Вводите по одному нику на строку (регистр учитывается)."
-        ))
+        )
+        self.bot_names_hint.setWordWrap(True)
+        layout.addWidget(self.bot_names_hint)
         self.text_edit = PlainTextEdit()
         self.text_edit.setPlaceholderText("nightbot\nstreamelements\nmoobot\nwizebot")
         self.text_edit.setStyleSheet("font-family: 'Consolas', monospace; font-size: 13px;")
         layout.addWidget(self.text_edit)
         save_btn = PrimaryPushButton("💾 Сохранить список")
+        save_btn.setFixedHeight(40)
+        save_btn.setMinimumWidth(200)
         save_btn.clicked.connect(self._on_save)
         layout.addWidget(save_btn)
 
@@ -652,7 +714,7 @@ class MemoryInfoWorker(QThread):
         self.info_ready.emit(info)
 
 
-class PerformanceSettingsPage(QWidget):
+class PerformanceSettingsPage(ScrollableSettingsPage):
     """Настройки CPU/GPU и lowvram."""
 
     settings_saved = pyqtSignal(bool)
@@ -670,9 +732,7 @@ class PerformanceSettingsPage(QWidget):
 
     def _init_ui(self):
         from PyQt5.QtCore import QTimer
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(30, 30, 30, 30)
-        layout.setSpacing(20)
+        layout = self.content_layout
 
         layout.addWidget(SubtitleLabel("Производительность"))
 
@@ -723,6 +783,7 @@ class PerformanceSettingsPage(QWidget):
             "Это снижает потребление VRAM, но немного замедляет генерацию.\n"
             "⚠️ Настройки применяются только после перезапуска приложения!"
         )
+        hint.setWordWrap(True)
         hint.setStyleSheet("color: gray; font-size: 12px;")
         settings_layout.addWidget(hint)
 
@@ -744,9 +805,12 @@ class PerformanceSettingsPage(QWidget):
         memory_layout.addWidget(self.memory_bar)
 
         self.memory_text_label = BodyLabel("Нажмите «Обновить» для получения данных.")
+        self.memory_mode_label.setWordWrap(True)
         memory_layout.addWidget(self.memory_text_label)
 
         refresh_btn = PushButton(FluentIcon.SYNC, "Обновить")
+        refresh_btn.setFixedHeight(40)
+        refresh_btn.setMinimumWidth(200)
         refresh_btn.clicked.connect(self._refresh_memory)
         memory_layout.addWidget(refresh_btn)
 
@@ -757,23 +821,27 @@ class PerformanceSettingsPage(QWidget):
         audio_layout.setSpacing(10)
 
         audio_layout.addWidget(StrongBodyLabel("Устройство вывода звука"))
-
-        audio_layout.addWidget(BodyLabel(
+        audio_hint = BodyLabel(
             "Закрепляет вывод озвучки на выбранном устройстве, "
             "даже если игра меняет устройство по умолчанию."
-        ))
+        )
+        audio_hint.setWordWrap(True)
+        audio_layout.addWidget(audio_hint)
 
         self.audio_device_combo = ComboBox()
         audio_layout.addWidget(self.audio_device_combo)
 
-        audio_hint = BodyLabel(
+        update_audio_hint = BodyLabel(
             "💡 Настройка применяется сразу.\n"
             "Если нужного устройства нет в списке, подключи его и нажми «Обновить устройства»."
         )
-        audio_hint.setStyleSheet("color: gray; font-size: 12px;")
-        audio_layout.addWidget(audio_hint)
+        update_audio_hint.setWordWrap(True)
+        update_audio_hint.setStyleSheet("color: gray; font-size: 12px;")
+        audio_layout.addWidget(update_audio_hint)
 
         refresh_audio_btn = PushButton(FluentIcon.SYNC, "Обновить устройства")
+        refresh_audio_btn.setFixedHeight(40)
+        refresh_audio_btn.setMinimumWidth(200)
         refresh_audio_btn.clicked.connect(self._refresh_audio_devices)
         audio_layout.addWidget(refresh_audio_btn)
 
@@ -781,6 +849,8 @@ class PerformanceSettingsPage(QWidget):
 
         # === Сохранение ===
         save_btn = PrimaryPushButton("💾 Сохранить настройки производительности")
+        save_btn.setFixedHeight(40)
+        save_btn.setMinimumWidth(200)
         save_btn.clicked.connect(self._on_save)
         layout.addWidget(save_btn)
 
