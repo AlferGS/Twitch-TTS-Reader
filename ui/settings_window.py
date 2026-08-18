@@ -34,30 +34,49 @@ from core.tts_service import get_output_audio_devices
 class ScrollableSettingsPage(QWidget):
     """
     Базовая страница настроек с автоматическим скроллом.
-
     Все страницы настроек должны наследоваться от этого класса.
+
     Контент добавляется в self.content_layout.
     """
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setObjectName("ScrollableSettingsPage")
 
         outer_layout = QVBoxLayout(self)
         outer_layout.setContentsMargins(0, 0, 0, 0)
         outer_layout.setSpacing(0)
 
         self._scroll_area = ScrollArea()
+        self._scroll_area.setObjectName("PageScrollArea")
         self._scroll_area.setWidgetResizable(True)
         self._scroll_area.setFrameShape(QFrame.NoFrame)
 
         self._content_widget = QWidget()
+        self._content_widget.setObjectName("PageContent")
         self.content_layout = QVBoxLayout(self._content_widget)
         self.content_layout.setContentsMargins(30, 30, 30, 30)
         self.content_layout.setSpacing(20)
-
         self._scroll_area.setWidget(self._content_widget)
+
+        # viewport по умолчанию красится белым из системной палитры —
+        # делаем его прозрачным, чтобы сквозила тема окна (светлая/тёмная)
+        self._scroll_area.viewport().setObjectName("PageViewport")
+
         outer_layout.addWidget(self._scroll_area)
 
+        # Прозрачный фон только для контейнеров (селекторы по objectName,
+        # чтобы не задевать CardWidget/лейблы — у них своя темовая qss)
+        self.setStyleSheet("""
+            QWidget#ScrollableSettingsPage,
+            QScrollArea#PageScrollArea,
+            QWidget#PageViewport,
+            QWidget#PageContent {
+                background-color: transparent;
+                border: none;
+            }
+        """)
+        
 XTTS_API_URL = "http://localhost:8020"
 _voices_cache = None
 _cache_timestamp = 0

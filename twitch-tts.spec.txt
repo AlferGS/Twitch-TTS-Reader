@@ -53,15 +53,6 @@ try:
 except Exception:
     pass
 
-for pkg in ['unidic_lite', 'fugashi', 'g2pkk', 'jamo', 'hangul_romanize',
-            'gruut_lang_de', 'gruut_lang_es', 'gruut_lang_fr',
-            'bangla', 'bnunicodenormalizer']:
-    try:
-        datas += collect_data_files(pkg)
-        print(f"  ✓ data: {pkg}")
-    except Exception:
-        print(f"  · data: {pkg} — пропущен")
-
 # ---------- 3. Подмодули (hiddenimports УЖЕ определён) ----------
 for pkg in ['TTS', 'xtts_api_server', 'gruut', 'qfluentwidgets']:
     try:
@@ -88,9 +79,6 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=['rthook_torchscript.py'],
     excludes=[
-        'tkinter', 'IPython', 'jupyter', 'pytest',
-        'TTS.trainer', 'tensorboard', 'tensorboard_data_server',
-        'coqui_tts_trainer', 'umap_learn', 'pynndescent', 'Cython',
     ],
     noarchive=False,
 )
@@ -102,8 +90,15 @@ a = Analysis(
 def _drop_data(entry):
     name, src, typecode = entry
     low = src.replace('\\', '/').lower()
-    # ТОЛЬКО веса моделей. Словари языков нужны TTS на старте!
-    return low.endswith(('.pth', '.pt'))
+    if low.endswith(('.pth', '.pt')):                    # веса моделей (model.pth)
+        return True
+    if 'sudachidict' in low or low.endswith('.dic'):     # словарь JP, ~207 МБ
+        return True
+    if 'unidic' in low:                                  # словарь JP
+        return True
+    if 'gruut_lang_de' in low or 'gruut_lang_es' in low or 'gruut_lang_fr' in low:
+        return True
+    return False
 
 _removed = [e for e in a.datas if _drop_data(e)]
 a.datas = [e for e in a.datas if not _drop_data(e)]
@@ -119,7 +114,7 @@ exe = EXE(
     debug=False,
     strip=False,
     upx=False,
-    console=False,          # ← временно True, чтобы видеть трейсбеки в консоли
+    console=True,          # ← временно True, чтобы видеть трейсбеки в консоли
     target_arch=None,
 )
 
