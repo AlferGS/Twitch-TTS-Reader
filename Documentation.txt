@@ -1,0 +1,507 @@
+Принял все файлы. Ниже — полное техническое описание проекта, готовое для сохранения в файл (например, `PROJECT_DESCRIPTION.md` или `ДОКУМЕНТАЦИЯ.md`).
+
+---
+
+# Twitch TTS Reader — техническая документация
+
+## 1. Общие сведения
+
+**Twitch TTS Reader** — настольное приложение для Windows, которое читает чат Twitch-канала в реальном времени и озвучивает сообщения голосами на базе модели **XTTS v2** (coqui-tts) через локальный HTTP-сервер **xtts-api-server** (FastAPI/uvicorn, порт 8020).
+
+Ключевые возможности:
+
+- синтез речи XTTS v2 в режимах **CPU** и **GPU (CUDA)**;
+- кастомные голоса из WAV-файлов (папка `speakers/`);
+- привязка голосов к префиксам сообщений (`!m`, `!w`, …) и к конкретным пользователям;
+- ускорение речи без изменения тона (rubberband, fallback: soxr, линейная интерполяция);
+- поддержка Twitch **reply** (цитата родительского сообщения в чате);
+- игнор-списки слов (смайлы) и пользователей (боты);
+- «пасхалки» — случайные префиксы/постфиксы, добавляемые только к озвучиваемому тексту;
+- темы оформления: светлая / тёмная / авто;
+- переключатель озвучки, регулировка громкости и скорости «на лету»;
+- автоматическая очистка кэша аудио (`output/`);
+- сборка в единый exe-дистрибутив через PyInstaller (onedir).
+
+Стек: Python 3.11, PyQt5 + PyQt-Fluent-Widgets (UI), torch 2.5.1 (+cu121 для GPU), coqui-tts 0.24.1, xtts-api-server 0.9.0, fastapi/uvicorn, sounddevice/soundfile/soxr/pyrubberband, librosa/scipy/numba, набор фонемизаторов (gruut, mecab/unidic-lite, sudachipy, jieba, pypinyin, g2pkk и др.).
+
+---
+
+## 2. Архитектура
+
+### 2.1 Двухпроцессная схема
+
+Приложение состоит из **двух процессов**:
+
+1. **GUI-процесс** — Qt-интерфейс (splash, чат, настройки), чтение IRC, очередь сообщений, воспроизведение аудио.
+2. **Процесс XTTS-сервера** — FastAPI/uvicorn на `http://localhost:8020`, грузит модель XTTS v2 и синтезирует аудио.
+
+В **dev-режиме** сервер запускается как `python -m xtts_api_server` (или `python -m core.server_runner`).
+В **frozen-режиме** (exe) сервер — это **второй запуск того же exe** с флагом `--server` (`launcher.py` ветвится на старте).
+
+### 2.2 Конвейер данных (GUI-процесс)
+
+```
+Twitch IRC (сокеты, теги)
+        │  message_received(username, display_text, speak_text, prefix, reply_info)
+        ▼
+TwitchChatReader (QThread)
+        ▼
+MainWindow.on_message_received
+   • игнор-пользователи (видно в чате, не озвучивается)
+   • добавление в чат (display_text)
+   • пасхалка (только speak_text)
+   • регистрация item_id в TTSService
+        ▼
+MessageQueue (потокобезопасная)  ← trim_to(max_queue_size)
+        ▼  (QTimer, 500 мс) _process_message_queue
+Выбор голоса: user_mappings → prefix_mappings → default_voice
+        ▼
+TTSService.speak(text, voice, item_id) → gen_queue
+        ▼  (поток TTS-Generator)
+POST http://localhost:8020/tts_to_audio/  {text, language:"ru", speaker_wav:voice}
+        ▼  WAV → soundfile → _apply_speed() → ready_queue
+        ▼  (поток TTS-Player)
+sounddevice.play (громкость, хвост тишины 0.15 c, до 3 попыток, выбор устройства)
+        ▼  on_speech_start / on_speech_end
+signals speech_started/speech_ended → подсветка сообщения в чате
+```
+
+### 2.3 Серверная сторона
+
+`xtts_api_server` (внешний пакет) при старте:
+
+- грузит модель XTTS v2 (`xtts_models/` рядом с exe или кэш Hugging Face `AppData\Local\tts\...`);
+- читает `speakers/*.wav` и предвычисляет латенты спикеров;
+- отдаёт `GET /speakers` (список голосов) и `POST /tts_to_audio/` (синтез WAV).
+
+Готовность сервера GUI определяет поллингом `GET /speakers` раз в секунду (таймаут `HEALTH_CHECK_TIMEOUT`).
+
+### 2.4 Потоки и таймеры
+
+| Компонент | Тип | Назначение |
+|---|---|---|
+| `TwitchChatReader` | QThread | IRC-подключение, парсинг, реконнект |
+| `ServerStartupWorker` | QThread | запуск сервера, health-check, стадии splash |
+| `VoicesLoader` | QThread | фоновое обновление списка голосов |
+| `MemoryInfoWorker` | QThread | опрос памяти GPU/RAM для страницы «Производительность» |
+| `TTS-Generator` | threading.Thread | HTTP-генерация аудио |
+| `TTS-Player` | threading.Thread | воспроизведение |
+| `process_timer` (MainWindow) | QTimer 500 мс | разбор очереди сообщений |
+| `cleanup_timer` (launcher) | QTimer 120 с | очистка `output/` |
+| `_refresh_timer` (PerformanceSettingsPage) | QTimer 5 с | автообновление памяти, пока страница видима |
+
+---
+
+## 3. Структура проекта
+
+```
+twitch-tts-reader/
+├── launcher.py            # Точка входа: сервер + splash + GUI; режим --server
+├── main.py                # Альтернативная точка входа (без запуска сервера)
+├── twitch-tts.spec        # Конфигурация PyInstaller
+├── rthook_torchscript.py  # Runtime-хук: исходники для TorchScript в exe
+├── requirements.txt       # Зафиксированные зависимости
+├── README.md              # Пользовательская документация
+├── .gitignore
+├── config.json            # Рабочая конфигурация (не коммитится)
+├── runtime_state.json     # Фактический режим сервера (пишется launcher'ом)
+├── core/                  # Бизнес-логика
+│   ├── error_logger.py    # Логи ошибок + debug-лог
+│   ├── message_queue.py   # Очередь сообщений
+│   ├── system_info.py     # CPU/CUDA, память, runtime_state
+│   ├── server_runner.py   # Dev-обёртка запуска xtts_api_server
+│   ├── tts_service.py     # Конвейер генерации и воспроизведения
+│   └── twitch_chat.py     # IRC-читалка чата (теги, reply, префиксы)
+├── ui/
+│   ├── main_window.py     # Главное окно FluentWindow, маршрутизация, пасхалки
+│   ├── chat_page.py       # Страница чата (HTML), слайдеры громкости/скорости
+│   ├── settings_window.py # Страницы настроек
+│   └── splash_window.py   # Splash-окно со стадиями запуска
+├── xtts_models/           # Модель XTTS v2 (вне git, ~1.8 ГБ)
+├── speakers/              # WAV-голоса
+├── rubberband/            # rubberband.exe для time-stretch
+├── output/                # Кэш аудио (runtime)
+└── error_logs/            # error_*.log + debug.log (runtime)
+```
+
+---
+
+## 4. Точки входа и сценарии запуска
+
+### 4.1 `launcher.py` (основная точка входа)
+
+Блок `__main__`:
+
+1. `multiprocessing.freeze_support()`;
+2. если `frozen` и в argv есть `--server` → `run_server_mode()` и выход (это серверный процесс);
+3. иначе `main()` — GUI-процесс.
+
+Особенности начала файла (до импортов):
+
+- `_IS_FROZEN` — детект exe-режима;
+- при `console=False` (`sys.stdout is None`) stdout/stderr перенаправляются в devnull, иначе библиотеки (qfluentwidgets) падают при импорте;
+- на Windows глобально патчится `subprocess.Popen.__init__`: к `creationflags` добавляется `CREATE_NO_WINDOW` (0x08000000), чтобы дочерние процессы не мигали консолью.
+
+### 4.2 `run_server_mode()` (сервер в exe)
+
+- патчит `inspect.getsource` (возврат `""` при `OSError`) — страховка для TorchScript;
+- пытается вызвать `core.system_info.apply_server_runtime_settings()` (применение режима CPU/CUDA, FP16, лимита VRAM);
+- убирает `--server` из argv и запускает `runpy.run_module("xtts_api_server", run_name="__main__")`.
+
+### 4.3 `main()` (GUI-процесс)
+
+- в frozen-режиме `os.chdir` в папку exe (все относительные пути — от exe);
+- `faulthandler.enable()`, глобальные хуки исключений;
+- QApplication (стиль Fusion, HighDPI PassThrough, `setQuitOnLastWindowClosed(False)`);
+- чтение `config.json` (тема до создания окон), `setTheme`;
+- `cpu_threads = config["cpu_threads"]` или `max(4, os.cpu_count()//2)`;
+- показ `SplashWindow`;
+- запуск `ServerStartupWorker`; по готовности сервера — импорт и показ `MainWindow`, splash закрывается;
+- периодическая очистка `output/` (`cleanup_timer`);
+- `atexit` + `aboutToQuit` → `cleanup_server_process` (taskkill /F /T дерева процессов сервера).
+
+### 4.4 `main.py`
+
+Минимальная альтернатива `launcher.py` без запуска сервера: тема из конфига, `MainWindow`, опциональный `cleanup_callback`. Используется, когда сервер поднят отдельно (dev).
+
+---
+
+## 5. Модуль `launcher.py` — состав
+
+### 5.1 Константы
+
+| Константа | Значение | Назначение |
+|---|---|---|
+| `XTTS_HOST` | `http://localhost:8020` | адрес сервера |
+| `HEALTH_CHECK_TIMEOUT` | 180 | таймаут готовности сервера, сек |
+| `HEALTH_CHECK_INTERVAL` | 1 | период поллинга, сек |
+| `OUTPUT_MAX_FILES` | 300 | лимит файлов в `output/` |
+| `OUTPUT_MAX_SIZE_MB` | 200 | лимит размера `output/` |
+| `OUTPUT_MIN_AGE_SEC` | 60 | не удалять файлы младше |
+| `CLEANUP_INTERVAL_SEC` | 120 | период автоочистки |
+
+### 5.2 Функции
+
+- `is_frozen()` — запуск как exe.
+- `app_root()` — корень приложения (папка exe или папка скрипта).
+- `clean_output_folder(app_dir, ...)` — приведение `output/` к лимитам: сортировка `.wav` по mtime, удаление старейших (кроме свежих), возврат `(deleted, freed_bytes)`.
+- `check_cuda()` — legacy-обёртка над `detect_cuda_available()`.
+- `cleanup_server_process(p)` — завершение сервера: Windows — `taskkill /F /T /PID`, иначе `killpg(SIGTERM)`; fallback `terminate()/kill()`.
+- `show_error_dialog(title, message)` — модальный диалог с кнопками «Открыть файл лога» / «Открыть папку с логами».
+
+### 5.3 Класс `ServerStartupWorker(QThread)`
+
+Сигналы: `stage_changed(str)`, `stage_text_changed(str)`, `server_ready(object)`, `error_occurred(str)`.
+
+Параметры конструктора: `cpu_threads=8`, `device_choice="auto"`, `use_lowvram=True`, `vram_limit_mb=0`.
+
+`run()` — последовательность стадий (`config` → `gpu` → `server_start` → `model_load`):
+
+1. `detect_cuda_available()` (nvidia-smi) и `resolve_runtime_mode(...)`;
+2. предупреждение, если запрошен CUDA, но GPU нет;
+3. env-переменные `TTS_DEVICE_MODE`, `TTS_USE_LOWVRAM`, `TTS_VRAM_LIMIT_MB` + запись `runtime_state.json`;
+4. очистка `output/` при старте;
+5. команда сервера: frozen — `[sys.executable, "--server"]`, dev — `[sys.executable, "-m", "xtts_api_server"]`; `--device cuda|cpu`, `--lowvram`;
+6. в CPU-режиме: `OMP/MKL/NUMEXPR_NUM_THREADS = cpu_threads`; на Windows `CREATE_NEW_PROCESS_GROUP` (+ `BELOW_NORMAL_PRIORITY_CLASS` для CPU);
+7. `Popen`, затем поллинг `GET /speakers` до таймаута; успех → `server_ready(process)`; таймаут/исключение → `log_error` + `error_occurred`.
+
+---
+
+## 6. Пакет `core/`
+
+### 6.1 `core/error_logger.py`
+
+Критические логи: каждый `log_error(...)` создаёт `error_logs/error_YYYY-MM-DD_HH-MM-SS.log` с контекстом, блоком системной информации (Python, platform, executable, frozen, GPU/CUDA через torch, RAM через psutil) и traceback. Хранится не более `MAX_LOG_FILES = 50`.
+
+- `get_app_dir() / get_logs_dir() / get_log_path()` — пути (работают в exe и в скрипте).
+- `cleanup_old_logs()` — ротация error-логов.
+- `_write_log(content)` — потокобезопасная запись в новый файл (lock).
+- `_get_system_info()` — диагностический блок.
+- `log_error(error_type, error_value, tb=None, context=None)` — запись критической ошибки, возврат пути.
+- `log_message(message, level)` / `log_startup_stage(stage)` — консольные сообщения.
+- `log_unhandled_exception` / `log_thread_exception` / `install_exception_hooks()` — глобальные обработчики `sys.excepthook` и `threading.excepthook`.
+
+Debug-лог: `error_logs/debug.log`, ротация при 5 МБ (`debug.log → debug.log.1`), формат строки:
+
+```
+[2026-06-16 12:00:00.123] [TTS] gen ready | item_id="42" ms="812" status="200"
+```
+
+- `log_debug(source, message, **fields)` — короткая техническая запись; значения экранируются и обрезаются до 200 символов; логгер никогда не роняет приложение.
+
+### 6.2 `core/message_queue.py`
+
+`MessageQueue` — быстрая потокобезопасная очередь на `queue.SimpleQueue` со счётчиком (`__slots__`).
+
+- `add_message(username, speak_text, prefix, item_id)`;
+- `get_next()` — неблокирующе, `None` если пусто;
+- `is_empty()`, `size()`;
+- `clear()` — полная очистка, возвращает число удалённых;
+- `trim_to(max_size)` — сброс старейших сверх лимита, возвращает число сброшенных.
+
+### 6.3 `core/system_info.py`
+
+Константы режимов: `DEVICE_MODE_AUTO/"auto"`, `DEVICE_MODE_CPU/"cpu"`, `DEVICE_MODE_CUDA/"cuda"`; `RUNTIME_STATE_FILENAME="runtime_state.json"`.
+
+- `is_frozen()`, `app_root()`;
+- `_run_command(cmd, timeout=3)` — безопасный subprocess (Windows: без окна); коды ошибок: -1 OSError, -2 timeout, -3 прочее;
+- `detect_cuda_available(timeout=3)` — `nvidia-smi -L`;
+- `query_gpu_memory_mb()` — `nvidia-smi --query-gpu=memory.used,memory.total`; агрегация по всем GPU; dict `used_mb/total_mb/available_mb/percent` или `None`;
+- `query_cpu_memory_mb()` — psutil;
+- `resolve_runtime_mode(config, cuda_available=None)` — auto→(cuda если есть GPU, иначе cpu); cpu→cpu; cuda→cuda/cpu-fallback;
+- `read_runtime_state() / write_runtime_state(state)` — чтение/запись `runtime_state.json`;
+- `load_basic_config()` — чтение `config.json`;
+- `get_expected_mode(config)` — фактический режим из runtime_state или расчётный;
+- `get_memory_info(mode)` / `get_memory_info_for_config(config)` — память устройства для UI.
+
+### 6.4 `core/server_runner.py`
+
+Dev-обёртка: `apply_server_runtime_settings()` → очистка argv от `--server` → `runpy.run_module("xtts_api_server", "__main__")`.
+
+### 6.5 `core/tts_service.py`
+
+Модульный уровень: опциональные импорты `sounddevice/soundfile/soxr/pyrubberband` с флагами `_HAS_*`; `_setup_rubberband_path()` добавляет локальную папку `rubberband/` (корень проекта или папка exe) в `PATH`, чтобы pyrubberband нашёл `rubberband.exe`; `get_output_audio_devices()` — список имён устройств вывода.
+
+Класс `TTSService` — конвейер «генерация → воспроизведение»:
+
+- `GENERATION_TIMEOUT = 60` — таймаут одного HTTP-запроса синтеза;
+- `__init__(api_url="http://localhost:8020/tts_to_audio/")` — две `SimpleQueue` (`gen_queue`, `ready_queue`), `volume=0.8`, `speed=1.0`, `preserve_pitch=True`, карта `items_map` (item_id → item) с lock, колбэки `on_speech_start/on_speech_end`, `requests.Session` с ретраями (1 повтор, backoff 0.1, коды 500/502/503/504), запуск рабочих потоков;
+- `register_item / unregister_item / get_item` — реестр активных сообщений (для отвязки при удалении из чата);
+- `speak(text, voice, item_id)` — постановка в `gen_queue` (проверки running/enabled/пустоты);
+- `set_volume(0..1)`, `set_speed(0.5..2.0)`;
+- `_apply_speed(...)` — ускорение: **rubberband** `time_stretch` (сохранение тона) → **soxr** resample до `sr/speed` → **линейная интерполяция** `np.interp`;
+- `set_output_device(query)` — закреп устройства вывода по подстроке имени (пусто = по умолчанию);
+- `_resolve_output_device()` — поиск индекса устройства; предупреждение один раз на запрос;
+- `_generator_loop()` (поток `TTS-Generator`): выборка `(text, voice, item_id)` → POST `{text, language:"ru", speaker_wav:voice}` → разбор WAV (`soundfile`) → `_apply_speed` → `ready_queue`; множественные проверки stop/enabled; обработка Timeout / ConnectionError (пауза 0.2 с) / RequestException / прочих; подробный `log_debug` с замерами времени;
+- `_player_loop()` (поток `TTS-Player`): громкость (`audio * volume`), хвост тишины 0.15 с, до **3 попыток** воспроизведения (выбранное устройство → перевыбор устройства → устройство по умолчанию), `sd.play + sd.wait`; колбэки начала/конца речи;
+- `clear_queue()`, `flush()` — очистка очередей и `sd.stop()` **без остановки потоков** (потоки продолжают жить);
+- `set_enabled(enabled)` — выключение озвучки без убийства потоков (при выключении — `flush()`);
+- `clear_and_stop()` — очистка + `_stop_event`;
+- `stop()` — полная остановка: `running=False`, stop-event, sentinels `None` в очереди, закрытие сессии;
+- `is_busy()`; вспомогательные `_safe_sd_stop()`, `_safe_callback()`, `_log_output_device()`, `_invoke_callback()`.
+
+### 6.6 `core/twitch_chat.py`
+
+Константы: `MAX_SPEAK_CHARS = 200`; набор regex (`_RE_CHANNEL` — 3 шаблона URL, `_RE_MENTION`, `_RE_URL`, `_RE_SPACES`, `_RE_PUNCT`, `_RE_USERNAME`, `_RE_PRIVMSG`, `_RE_REPEAT_PUNCT`); `_EXCLUDED_CHANNELS` (popout, videos, directory…); `_IRC_SERVERS` — `irc.chat.twitch.tv:6667/443`.
+
+Класс `TwitchChatReader(QThread)`:
+
+Сигналы: `message_received(str, str, str, str, object)` = (username, display_text, speak_text, prefix, reply_info); `error_occurred(str)`.
+
+- `__init__(channel_url, prefix_mappings, ignore_words)` — префиксы сортированы по длине (убыв.) и скомпилированы в `^prefix\s+`; ignore-слова в `\bword\b` (IGNORECASE);
+- `_extract_channel_name(url)` — извлечение канала из URL с исключением служебных слов;
+- `_clean_for_speech(text)` — нормализация под XTTS v2: удаление @ников, URL, стоп-слов; схлопывание пробелов; «!!!»→«!», «…»→«.»; обрезка краевой пунктуации; длинный КАПС → нижний регистр (`_fix_caps`: слово >3 букв всё капсом); обрезка до 200 символов по границе слова; для 3+ слов без конечной пунктуации добавляется пробел (маркер конца фразы, меньше обрывов);
+- `_clean_for_display(text)` — только схлопывание пробелов;
+- `_parse_tags(line)` — IRCv3-теги с ан-эскейпом (`\:`, `\s`, `\\`, `\r`, `\n`);
+- `_extract_reply_info(tags)` — reply-метаданные (`reply-parent-*`);
+- `run()` — цикл с реконнектом (задержка 5 с); невалидный канал → `error_occurred`;
+- `_connect_and_listen()` — анонимный вход `justinfanNNNNN`; `CAP REQ :twitch.tv/tags twitch.tv/commands`; `NICK`, `JOIN`; перебор серверов; PING→PONG; буферизация строк; `PRIVMSG` → `_parse_message`;
+- `_parse_message(line)` — теги → reply; username; текст; поиск префикса (первый совпавший из отсортированных); `display_text` и `speak_text` без префикса; emit сигнала;
+- `stop()`, `is_running()`.
+
+---
+
+## 7. Пакет `ui/`
+
+### 7.1 `ui/splash_window.py`
+
+`STARTUP_STAGES` — стадии: `config` (Конфигурация), `gpu` (Проверка GPU), `server_start` (Запуск сервера), `model_load` (Загрузка модели), `ui` (Интерфейс).
+
+`SplashWindow(QDialog)` — безрамное окно поверх всех, 340×320, центрируется: заголовок, `IndeterminateProgressRing` (fallback `QProgressBar`), текстовая строка стадии, панель стадий.
+
+- `set_stage(key)` — прошедшие стадии «✓» (зелёные), текущая «◌» (синяя жирная), будущие «○» (серые);
+- `set_stage_text(text)` — обрезка до 40 символов;
+- `set_error()` — «❌ Ошибка запуска»;
+- `stop_animation()`, `closeEvent`.
+
+### 7.2 `ui/chat_page.py`
+
+Константы: `NICK_COLORS` (8 цветов), `REPLY_TEXT_MAX_LENGTH = 120`.
+
+`SliderFlyoutView(FlyoutViewBase)` — всплывающий слайдер с заголовком и форматированным значением; сигнал `value_changed(float)`.
+
+`ChatPage(QWidget)` — страница чата с HTML-рендерингом в `QTextBrowser`.
+
+Сигналы: `start_requested`, `stop_requested`, `volume_changed(float)`, `speed_changed(float)`, `item_removed(int)`, `tts_enabled_changed(bool)`.
+
+- UI: заголовок со счётчиком; кнопки «▶ Запустить» / «⏹ Остановить»; ToolButton громкости и скорости (flyout-слайдеры, fallback — QDialog); переключатель «Озвучка» (блокирует слайдеры при выключении);
+- `add_message(username, text, msg_type, reply_info) -> msg_id` — добавление с тримом до `message_limit` (удалённые шлют `item_removed`);
+- `set_message_limit`, `set_user_colors`, `refresh_theme`;
+- `_get_html_style()` — тема-зависимый CSS (dark/light: фон, текст, системные/ошибочные цвета, цвета reply-цитат);
+- `_format_reply_html(...)` — цитата родителя: «↪ ник: текст» (обрезка 120 символов);
+- `_message_to_html(msg)` — блоки system/error/normal; подсветка активного сообщения **inline-фоном** (`#4a4520` тёмная / `#FFF59D` светлая — Qt не применяет вложенные CSS-селекторы к вложенным блокам); цветной ник (из `user_colors` или `hash(username) % len(NICK_COLORS)`);
+- `_render_html(scroll_to_active)` — перерисовка с сохранением позиции скролла (автопрокрутка, если были внизу);
+- `highlight_item / unhighlight_item / clear_highlight` — подсветка озвучиваемого сообщения;
+- `set_running_state(is_running)` — состояние кнопок.
+
+### 7.3 `ui/main_window.py`
+
+`EASTER_MAX_SPEAK_CHARS = 200`.
+
+`MainWindow(FluentWindow)` — все страницы в одном окне.
+
+Сигналы: `speech_started(int)`, `speech_ended(int)` (маршрутизация колбэков TTSService в подсветку чата).
+
+Состав и поведение:
+
+- `__init__` — загрузка конфига, `MessageQueue`, `TTSService`, устройство вывода из конфига, `tts_enabled=True`, `max_queue_size`; таймер разбора очереди 500 мс; автостарт чата при `auto_start` и заданном `channel_url`;
+- `closeEvent` — остановка таймера, чата (wait 2 с), TTS, очистка очереди, `_cleanup_callback` (убийство сервера), `QApplication.quit`;
+- `_load_config()` — дефолтный конфиг (см. раздел 8), создание файла при отсутствии, миграция;
+- `_migrate_config(config, default)` — переезд со старых ключей `male_prefix/female_prefix/male_voice/female_voice` на `prefix_mappings`; дозаполнение отсутствующих ключей дефолтами;
+- `_save_config()/_write_config()` — запись `config.json` (indent=2, ensure_ascii=False);
+- `_init_pages()` — `ChatPage(message_limit, user_colors)` + 6 страниц настроек; привязка `tts_service.on_speech_start/end`;
+- `_init_navigation()` — верхняя навигация: Чат, Общие, Голоса, Привязки, Стоп-слова, Боты, Производительность; внизу — страница «Сохранить» с кнопкой «💾 Сохранить все настройки»; первичная загрузка конфига в страницы;
+- `_connect_signals()` — чат → start/stop/volume/speed/item_removed/tts_enabled; `settings_saved` всех страниц → `_on_any_settings_saved`;
+- `_apply_theme()` — `setTheme` по конфигу + `chat_page.refresh_theme()`;
+- `start_chat()` — проверки (нет URL → InfoBar; уже запущен → InfoBar); создание `TwitchChatReader(channel_url, prefix_mappings, ignore_words)`; подключение сигналов; старт;
+- `stop_chat()` — остановка чата; **`tts_service.flush()`** (не `clear_and_stop()`, которая навсегда убивает потоки); очистка очереди и подсветки;
+- `on_message_received(...)` — игнор-пользователи (только показ); добавление в чат; пасхалка только к `speak_text`; регистрация и постановка в очередь; `trim_to(max_queue_size)`;
+- `_on_chat_error(msg)` — ошибка в чат; «Не удалось определить канал» → InfoBar + `stop_chat()`;
+- `_process_message_queue()` — каждые 500 мс выгребает очередь целиком: выбор голоса → `tts_service.speak`;
+- `_get_voice_for_user(username, prefix)` — приоритет: `use_prefixes=False` → default; `user_mappings[username]`; `prefix_mappings[prefix]`; `default_voice`;
+- блок пасхалок (см. 7.4);
+- `_save_all_settings()` — save всех страниц + запись конфига + InfoBar (успех + предупреждение, что GPU/LowVRAM применяются после перезапуска) + `_on_any_settings_saved(True)`;
+- `_on_any_settings_saved(requires_reconnect)` — применение лимита чата, цветов ников, темы, аудиоустройства; при `requires_reconnect` и работающем чате — перезапуск чата (stop → start через 500 мс);
+- `_on_tts_enabled_changed(enabled)` — флаг, `tts_service.set_enabled`, при выключении — очистка очереди и подсветки.
+
+### 7.4 Алгоритм пасхалок (MainWindow)
+
+- применяются **только к озвучиваемому тексту**, с шансом `easter_egg_chance`, режимы `auto/prefix/postfix`;
+- не применяются к сообщениям короче 2 слов и если текст уже начинается/заканчивается такой же вставкой;
+- нормализация вставок: `_normalize_easter_prefix` («однажды,» → «однажды, »), `_normalize_easter_postfix` (»,и это начало» → «, и это начало»);
+- префикс: первая буква текста понижается (`_lower_first_letter`, работает через кавычки/скобки), текст обрезается под лимит (`_truncate_text_to_limit` по границе слова);
+- постфикс: пунктуационный клеится без пробела, прочий — с пробелом;
+- `auto` при наличии обоих типов выбирает тип 50/50;
+- финальная страховка: результат длиннее `EASTER_MAX_SPEAK_CHARS` (200) → возвращается исходный текст.
+
+### 7.5 `ui/settings_window.py`
+
+Модульный уровень: `XTTS_API_URL = "http://localhost:8020"`; кэш голосов с TTL 300 с; `MESSAGE_LIMIT_PRESETS = ["25","50","75","100","150"]`; `NICK_COLOR_OPTIONS` («Авто» + 8 цветов); `THEME_OPTIONS` (light/dark/auto).
+
+- `get_available_voices(force_refresh=False, timeout=2)` — `GET /speakers` с кэшем; поддержка str/dict-элементов; при ошибке — старый кэш или `[]`;
+- `VoicesLoader(QThread)` — фоновое принудительное обновление (timeout 30), сигнал `voices_loaded(list)`.
+
+`ScrollableSettingsPage(QWidget)` — **базовая страница настроек**: `ScrollArea` + контент-виджет с `content_layout`. Фон контейнеров (страница, ScrollArea, viewport, контент) принудительно прозрачный через stylesheet по `objectName` — иначе viewport `QScrollArea` красится белым из системной палитры и ломает тёмную тему.
+
+Все страницы имеют сигнал `settings_saved(bool)` (True = требуется переподключение к чату) и методы `load(config)` / `save(config)`.
+
+- `GeneralSettingsPage` — URL канала, автостарт, лимит истории чата, тема, переключатель пасхалок. `requires_reconnect` = изменился `channel_url`.
+- `VoicesSettingsPage` — голос по умолчанию (combo с асинхронной загрузкой списка и фоновым обновлением), переключатель префиксов с подсказкой, таблица «Префикс → Голос» (добавить/удалить строки).
+- `UsersSettingsPage` — таблица «Никнейм → Голос + Цвет ника»; при загрузке объединяет ключи `user_mappings` и `user_colors`; при сохранении раскладывает обратно.
+- `IgnoreWordsPage` — многострочный список слов; `requires_reconnect` = изменился набор.
+- `IgnoreUsersPage` — многострочный список ников.
+- `MemoryInfoWorker(QThread)` — фоновый `get_memory_info_for_config`, сигнал `info_ready(dict)`.
+- `PerformanceSettingsPage` — текущий режим сервера и Low VRAM (из `runtime_state.json`); выбор режима (`auto/cpu/cuda`) и Low VRAM (применяются **после перезапуска**); карточка памяти устройства (прогресс-бар, ручное и автообновление каждые 5 с, пока страница видима — `showEvent/hideEvent`); выбор устройства вывода звука (применяется **сразу**, список из `get_output_audio_devices()`, кастомное значение сохраняется в списке даже при отсутствии устройства).
+
+---
+
+## 8. Конфигурация
+
+### 8.1 `config.json` (ключи, типы, дефолты)
+
+| Ключ | Тип | Дефолт | Описание |
+|---|---|---|---|
+| `channel_url` | string | `""` | URL Twitch-канала |
+| `default_voice` | string | `"anime_girl"` | Голос по умолчанию (имя WAV без расширения) |
+| `use_prefixes` | bool | `true` | Использовать префиксы и привязки пользователей |
+| `prefix_mappings` | object | `{"!m":"game_hero","!w":"anime_girl"}` | Префикс → голос |
+| `auto_start` | bool | `false` | Автозапуск чтения чата при старте |
+| `user_mappings` | object | `{}` | Ник → голос (приоритет над префиксами) |
+| `user_colors` | object | `{}` | Ник → hex-цвет ника в чате |
+| `ignore_words` | list | набор смайлов | Слова, удаляемые из озвучки |
+| `ignore_users` | list | боты | Ники: видны в чате, не озвучиваются |
+| `message_limit` | int | `100` | Лимит сообщений в окне чата |
+| `easter_egg_enabled` | bool | `false`* | Включить пасхалки (*в дефолте кода `True` в шаблоне окна, но `load` читает из конфига) |
+| `easter_egg_chance` | float | `0.03` | Вероятность пасхалки (0..1) |
+| `easter_egg_mode` | string | `"auto"` | `auto` / `prefix` / `postfix` |
+| `easter_egg_prefixes` | list | `["однажды, "]` | Префиксы пасхалок |
+| `easter_egg_postfixes` | list | набор | Постфиксы пасхалок |
+| `max_queue_size` | int | `10` | Макс. размер очереди сообщений |
+| `audio_device` | string | `""` | Подстрока имени устройства вывода (пусто = по умолчанию) |
+| `theme` | string | `"auto"` | `light` / `dark` / `auto` |
+| `device_mode` | string | `"auto"` | `auto` / `cpu` / `cuda` |
+| `use_lowvram` | bool | `true` | Low VRAM (только GPU) |
+| `cpu_threads` | int | `0` | Потоки CPU-синтеза (0 = половина ядер) — читает launcher |
+| `vram_limit_mb` | int | `0` | Лимит VRAM — читает launcher |
+
+### 8.2 `runtime_state.json`
+
+Пишется `ServerStartupWorker` при каждом запуске; читается страницей «Производительность»:
+
+```json
+{ "device_choice", "device_mode", "cuda_available", "use_lowvram", "vram_limit_mb" }
+```
+
+### 8.3 Переменные окружения (ставит launcher)
+
+- `TTS_DEVICE_MODE`, `TTS_USE_LOWVRAM`, `TTS_VRAM_LIMIT_MB` — режим сервера;
+- `OMP_NUM_THREADS`, `MKL_NUM_THREADS`, `NUMEXPR_NUM_THREADS` — потоки в CPU-режиме;
+- `PATH` дополняется папкой `rubberband/` (в `tts_service`).
+
+---
+
+## 9. Логирование и диагностика
+
+- `error_logs/error_*.log` — критические ошибки (диалог показывает путь к последнему файлу);
+- `error_logs/debug.log` — технический поток событий (APP/IRC/TTS), ротация 5 МБ;
+- консоль: `log_message`/`log_startup_stage` (в windowed-сборке уходит в devnull);
+- необработанные исключения главного и рабочих потоков перехватываются глобальными хуками и пишутся в error-лог.
+
+---
+
+## 10. Сборка и дистрибуция (PyInstaller)
+
+### 10.1 `twitch-tts.spec` — ключевые решения
+
+1. **`hiddenimports` объявляются до циклов сбора** (иначе `+=` упадёт): uvicorn-подмодули, сервер (`xtts_api_server`, fastapi, starlette, pydantic…), torch-стек (TTS, torch, torchaudio, transformers, tokenizers, safetensors, huggingface_hub, scipy, librosa, numba, llvmlite, sklearn, soundfile/sounddevice/soxr/pyrubberband), собственные модули `core.*`/`ui.*`, фонемизаторы EN/RU.
+2. **Данные без весов моделей**: `collect_data_files(...)` для qfluentwidgets, xtts_api_server, num2words, anyascii, inflect, gruut, gruut_lang_en с `excludes=['**/*.pth','**/*.pt','**/*.bin','**/*.onnx','**/*.safetensors']`.
+3. **Исходники `.py` пакета TTS включаются в бандл** (`include_py_files=True`) — **TorchScript (`torch.jit.script` в `wavenet.py`) требует доступ к исходному коду в frozen-режиме**.
+4. **Данные фонемизаторов, для которых нет хуков PyInstaller**, собираются явно: `unidic_lite`, `fugashi`, `g2pkk`, `jamo`, `hangul_romanize`, `gruut_lang_de/es/fr`, `bangla`, `bnunicodenormalizer` (словари нужны TTS **на старте** — ja_jp фонемизатор создаёт MeCab при импорте модуля).
+5. `collect_submodules` для `TTS`, `xtts_api_server`, `gruut`, `qfluentwidgets`.
+6. `copy_metadata` для набора пакетов (transformers, TTS, torch, fastapi, …).
+7. `runtime_hooks=['rthook_torchscript.py']`.
+8. `excludes`: `tkinter, IPython, jupyter, pytest, TTS.trainer, tensorboard, tensorboard_data_server, coqui_tts_trainer, umap_learn, pynndescent, Cython` — обучение/аналитика, не участвующие в стартовой цепочке сервера.
+9. **Фильтр `_drop_data` после `Analysis`**: из `a.datas` удаляются **только веса моделей** (`.pth/.pt`) — модель XTTS v2 остаётся внешней (папка `xtts_models/` или кэш HF), что экономит ~1.8 ГБ. Печатается сумма вырезанного.
+10. `EXE(console=...)` — флаг консоли управляет видимостью трейсбеков при отладке; `COLLECT` — onedir-дистрибутив `TwitchTTSReader`.
+
+### 10.2 `rthook_torchscript.py`
+
+В frozen-режиме патчит `inspect.getsourcefile`: относительные `co_filename` замороженных модулей резолвятся относительно `sys._MEIPASS`, где лежат включённые `.py`-исходники TTS — без этого `torch.jit.script` падает с `OSError: Can't get source`.
+
+### 10.3 Пост-сборка и релиз
+
+В `dist\TwitchTTSReader\` копируются внешние папки: `xtts_models/`, `speakers/`, `rubberband/`, а также `config.json`. Дистрибуция — zip папки `dist\TwitchTTSReader\`.
+
+### 10.4 Особенности frozen-режима (исторически выявленные)
+
+- сервер — второй процесс того же exe (`--server`); его вывод при `CREATE_NO_WINDOW` невидим, поэтому диагностика — только ручной запуск `TwitchTTSReader.exe --server --device cpu` с консолью;
+- `numpy.testing` нельзя исключать (нужен scipy в рантайме);
+- `matplotlib` обязателен (импортируется `TTS.tts.utils.visual` на старте);
+- словари языков обязательны на старте (инициализация фонемизаторов при импорте);
+- CUDA-библиотеки torch (~3.4 ГБ) — неотъемлемая часть бандла при GPU-сборке.
+
+---
+
+## 11. Зависимости (requirements.txt, ключевые группы)
+
+- **TTS/ML**: `coqui-tts 0.24.1`, `coqui-tts-trainer`, `torch/torchaudio 2.5.1+cu121`, `transformers 4.36.2`, `tokenizers`, `safetensors`, `huggingface_hub`, `encodec`, `einops`, `scipy`, `scikit-learn`, `librosa`, `numba/llvmlite`, `numpy 1.26.4`, `matplotlib`;
+- **сервер**: `xtts-api-server 0.9.0`, `fastapi`, `starlette`, `uvicorn`, `pydantic(2)`, `loguru`, `anyio`;
+- **фонемизаторы/языки**: `gruut` + `gruut_lang_en/de/es/fr`, `inflect`, `anyascii`, `num2words`, `mecab-python3`, `unidic-lite`, `fugashi`, `sudachipy/SudachiDict-core`, `cutlet`, `jamo`, `g2pkk`, `hangul-romanize`, `jieba`, `pypinyin`, `bangla`, `bnnumerizer`, `bnunicodenormalizer`, `nltk`, `spacy`, `stanza`;
+- **звук**: `sounddevice`, `soundfile`, `soxr`, `pyrubberband`, `PyAudio`, `pydub`;
+- **UI**: `PyQt5 5.15.11`, `PyQt5-Qt5`, `PyQt-Fluent-Widgets 1.11.3`, `PyQt5-Frameless-Window`, `darkdetect`;
+- **сборка/сервис**: `pyinstaller 6.22.0`, `pyinstaller-hooks-contrib`, `psutil`, `requests`, `pywin32`.
+
+---
+
+## 12. Известные особенности / TODO
+
+1. `core.system_info.apply_server_runtime_settings` вызывается из `launcher.run_server_mode()` и `core/server_runner.py`, но **не определена** в `core/system_info.py` → в frozen-режиме печатается `[ServerRuntime] setup failed: ImportError...` (не фатально: режим передаётся через env и аргументы CLI).
+2. В `core/error_logger.py` `_write_log` вызывает `_cleanup_old_logs()`, а определена `cleanup_old_logs()` — NameError ловится внутренним except (файл лога при этом успевает записаться).
+3. `HEALTH_CHECK_TIMEOUT = 180` может быть недостаточен для холодного старта на CPU (загрузка модели ~1–2 мин + предвычисление латентов); при нестабильности увеличивать до 600.
+4. Комментарий у `console` в `EXE(...)` в spec устарел (флаг уже `False`).
+5. README описывает не все ключи конфига (полный список — в разделе 8.1).
+6. Roadmap (из README): несколько каналов; настройка префиксов через UI (частично есть); экспорт/импорт настроек; стриминг с чанками; инсталлятор Windows.
+
+---
+
+Готово. Если нужно, могу сократить до краткой версии (одна страница) или, наоборот, расширить любой раздел (например, добавить диаграммы последовательности запуска или таблицу всех сигналов Qt).
